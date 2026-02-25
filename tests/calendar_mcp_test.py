@@ -132,7 +132,7 @@ async def run_tests():
                     "subject": "MCP Calendar Meeting Test",
                     "start": start.strftime("%Y-%m-%d %H:%M"),
                     "end": end.strftime("%Y-%m-%d %H:%M"),
-                    "required_attendees": "aaanerud@microsoft.com",
+                    "required_attendees": "user@example.com",
                     "location": "Virtual via MCP",
                     "body": "Meeting created through MCP calendar tools.",
                 })
