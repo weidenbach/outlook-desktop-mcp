@@ -71,7 +71,7 @@ def test_filter_unread(namespace):
 def test_send_email(outlook):
     """Test 5: Create and send a test email to self."""
     mail = outlook.CreateItem(0)  # 0 = olMailItem
-    mail.To = "aaanerud@microsoft.com"
+    mail.To = "user@example.com"
     mail.Subject = "Outlook Desktop MCP - COM Test"
     mail.Body = (
         "This is an automated test from the Outlook Desktop MCP COM validation.\n"
@@ -79,7 +79,7 @@ def test_send_email(outlook):
         "\nIf you received this, COM send_email works."
     )
     mail.Send()
-    log("  Email sent to aaanerud@microsoft.com")
+    log("  Email sent to user@example.com")
 
 
 def test_mark_read_unread(namespace):
