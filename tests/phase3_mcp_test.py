@@ -139,7 +139,7 @@ async def run_tests():
             log("\n--- Test 6: send_email ---")
             try:
                 result = await session.call_tool("send_email", {
-                    "to": "aaanerud@microsoft.com",
+                    "to": "user@example.com",
                     "subject": "Outlook Desktop MCP - Phase 3 MCP Test",
                     "body": "Sent through the MCP server via stdio. If you see this, the MCP layer works!",
                 })

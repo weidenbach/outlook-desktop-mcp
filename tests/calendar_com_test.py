@@ -139,12 +139,12 @@ def test_create_meeting(outlook):
     appt.Body = "Automated meeting test from calendar COM validation."
     appt.MeetingStatus = 1  # olMeeting
 
-    recipient = appt.Recipients.Add("aaanerud@microsoft.com")
+    recipient = appt.Recipients.Add("user@example.com")
     recipient.Type = 1  # olRequired
     appt.Recipients.ResolveAll()
 
     appt.Send()
-    log(f"  Meeting sent: '{appt.Subject}' to aaanerud@microsoft.com")
+    log(f"  Meeting sent: '{appt.Subject}' to user@example.com")
 
 
 def test_update_event(namespace):
