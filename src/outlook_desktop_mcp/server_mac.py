@@ -64,6 +64,32 @@ mcp = FastMCP(
 bridge = AppleScriptBridge()
 
 
+# --- Calendar config (which calendars to include) ---
+
+_CALENDAR_CONFIG_PATH = os.path.expanduser("~/.outlook_mcp_calendars.json")
+
+
+def _load_calendar_config() -> list[str] | None:
+    """Return list of included calendar names, or None if all calendars allowed."""
+    try:
+        with open(_CALENDAR_CONFIG_PATH) as f:
+            data = json.load(f)
+        included = data.get("included")
+        if isinstance(included, list) and included:
+            return included
+    except (FileNotFoundError, json.JSONDecodeError, KeyError):
+        pass
+    return None
+
+
+def _as_cal_filter(included: list[str] | None) -> str:
+    """Build an AppleScript list literal for the calendar filter."""
+    if not included:
+        return "{}"
+    items = ", ".join(f'"{n}"' for n in included)
+    return "{" + items + "}"
+
+
 # --- Helper: truncate long text ---
 
 def _truncate(text: str, max_length: int = 5000) -> str:
@@ -76,6 +102,200 @@ def _clean(value: str) -> str:
     """Replace AppleScript's 'missing value' with empty string."""
     v = value.strip()
     return "" if v == "missing value" else v
+
+
+# --- Recurrence projection ---
+
+_DAY_ABBR_TO_WEEKDAY = {"MO": 0, "TU": 1, "WE": 2, "TH": 3, "FR": 4, "SA": 5, "SU": 6}
+
+
+def _expand_recurrence(
+    master_start: datetime,
+    duration: timedelta,
+    rec_type: str,
+    interval: int,
+    days_csv: str,
+    end_date_str: str,
+    range_start: datetime,
+    range_end: datetime,
+    max_occurrences: int = 0,
+) -> list[datetime]:
+    """Expand a recurrence pattern into occurrence start times within a range.
+
+    Returns a list of datetime objects for each projected occurrence that
+    falls within [range_start, range_end].
+    max_occurrences limits the total number of occurrences from the series
+    start (0 = unlimited).
+    """
+    # Parse end date of the series (locale-independent ISO from AppleScript)
+    series_end = range_end
+    if end_date_str and end_date_str != "missing value":
+        try:
+            series_end = min(datetime.fromisoformat(end_date_str), range_end)
+        except ValueError:
+            pass
+
+    occurrences: list[datetime] = []
+    total_generated = 0  # counts ALL occurrences from series start
+    rec_type_lower = rec_type.lower()
+
+    if rec_type_lower == "daily":
+        dt = master_start
+        while dt <= series_end:
+            total_generated += 1
+            if max_occurrences and total_generated > max_occurrences:
+                break
+            if dt >= range_start:
+                occurrences.append(dt)
+            dt += timedelta(days=interval)
+
+    elif rec_type_lower == "weekly":
+        # Parse target weekdays
+        target_days = set()
+        for abbr in days_csv.split(","):
+            abbr = abbr.strip()
+            if abbr in _DAY_ABBR_TO_WEEKDAY:
+                target_days.add(_DAY_ABBR_TO_WEEKDAY[abbr])
+        if not target_days:
+            target_days = {master_start.weekday()}
+
+        # Walk week by week from the series start
+        # Find the Monday of the master_start week
+        week_start = master_start - timedelta(days=master_start.weekday())
+        done = False
+        while week_start <= series_end and not done:
+            for wd in sorted(target_days):
+                dt = week_start + timedelta(days=wd)
+                dt = dt.replace(hour=master_start.hour, minute=master_start.minute,
+                                second=master_start.second)
+                if dt < master_start:
+                    continue
+                if dt > series_end:
+                    done = True
+                    break
+                total_generated += 1
+                if max_occurrences and total_generated > max_occurrences:
+                    done = True
+                    break
+                if dt >= range_start:
+                    occurrences.append(dt)
+            week_start += timedelta(weeks=interval)
+
+    elif rec_type_lower == "monthly":
+        dt = master_start
+        while dt <= series_end:
+            total_generated += 1
+            if max_occurrences and total_generated > max_occurrences:
+                break
+            if dt >= range_start:
+                occurrences.append(dt)
+            # Advance by interval months
+            month = dt.month - 1 + interval
+            year = dt.year + month // 12
+            month = month % 12 + 1
+            day = min(dt.day, 28)  # safe day for all months
+            dt = dt.replace(year=year, month=month, day=day)
+
+    elif rec_type_lower == "yearly":
+        dt = master_start
+        while dt <= series_end:
+            total_generated += 1
+            if max_occurrences and total_generated > max_occurrences:
+                break
+            if dt >= range_start:
+                occurrences.append(dt)
+            try:
+                dt = dt.replace(year=dt.year + interval)
+            except ValueError:
+                break  # e.g. Feb 29 in non-leap year
+
+    return occurrences
+
+
+def _merge_projected_events(
+    materialized: list[dict],
+    recurring_masters: list[dict],
+    range_start: datetime,
+    range_end: datetime,
+) -> list[dict]:
+    """Expand recurring masters and merge with materialized events.
+
+    Materialized events take priority — if an occurrence matches an
+    existing materialized event (same master id, same date), skip it.
+    """
+    # Build set of (subject, date) for materialized events to deduplicate
+    materialized_keys: set[tuple[str, str]] = set()
+    for evt in materialized:
+        date_part = evt["start"][:10]  # "YYYY-MM-DD"
+        materialized_keys.add((evt["subject"], date_part))
+
+    projected: list[dict] = []
+    for master in recurring_masters:
+        try:
+            master_start = datetime.fromisoformat(master["start"])
+            master_end = datetime.fromisoformat(master["end"])
+        except ValueError:
+            continue
+        duration = master_end - master_start
+
+        max_occ = int(master.get("rec_max_occurrences") or 0)
+        occurrences = _expand_recurrence(
+            master_start=master_start,
+            duration=duration,
+            rec_type=master.get("rec_type", ""),
+            interval=int(master.get("rec_interval", 1)),
+            days_csv=master.get("rec_days", ""),
+            end_date_str=master.get("rec_end_date", ""),
+            range_start=range_start,
+            range_end=range_end,
+            max_occurrences=max_occ,
+        )
+
+        for occ_start in occurrences:
+            occ_end = occ_start + duration
+            date_part = occ_start.strftime("%Y-%m-%d")
+            key = (master["subject"], date_part)
+            if key in materialized_keys:
+                continue  # already materialized
+            projected.append({
+                "entry_id": f"projected-{master['entry_id']}",
+                "subject": master["subject"],
+                "start": occ_start.strftime("%Y-%m-%d %H:%M:00"),
+                "end": occ_end.strftime("%Y-%m-%d %H:%M:00"),
+                "location": master.get("location", ""),
+                "organizer": master.get("organizer", ""),
+                "all_day": master.get("all_day", False),
+                "_projected": True,
+            })
+
+    return projected
+
+
+# --- Shared AppleScript date helpers (locale-independent) ---
+_APPLESCRIPT_DATE_HELPERS = '''on makeDate(yr, mo, dy, hr, mn)
+    set d to current date
+    set year of d to yr
+    set month of d to mo
+    set day of d to dy
+    set hours of d to hr
+    set minutes of d to mn
+    set seconds of d to 0
+    return d
+end makeDate
+
+on isoFmt(d)
+    set yr to (year of d) as text
+    set mo to (month of d as integer)
+    set dy to (day of d)
+    set hr to (hours of d)
+    set mn to (minutes of d)
+    set moS to text -2 thru -1 of ("0" & mo)
+    set dyS to text -2 thru -1 of ("0" & dy)
+    set hrS to text -2 thru -1 of ("0" & hr)
+    set mnS to text -2 thru -1 of ("0" & mn)
+    return yr & "-" & moS & "-" & dyS & " " & hrS & ":" & mnS & ":00"
+end isoFmt
+'''
 
 
 # --- UI Scraping for New Outlook for Mac ---
@@ -305,8 +525,7 @@ async def create_draft(
         for addr in addresses.split(";"):
             addr = addr.strip()
             if addr:
-                lines += f'make new {kind} at newMsg with properties {{email address:{{address:"{escape(addr)}"}}}}
-    '
+                lines += f'make new {kind} at newMsg with properties {{email address:{{address:"{escape(addr)}"}}}}\n'
         return lines
 
     to_lines = _recipient_lines(to, "to recipient")
@@ -858,6 +1077,88 @@ end tell'''
 
 
 # =====================================================================
+# TOOL 10a: list_calendars
+# =====================================================================
+
+@mcp.tool()
+async def list_calendars() -> str:
+    """List all available Outlook calendar folders.
+
+    Returns each calendar's name and account. Use the names with
+    configure_calendars to select which calendars to include in
+    list_events and search_events results.
+
+    Returns:
+        JSON array of calendar objects with name and account fields.
+    """
+    script = '''tell application "Microsoft Outlook"
+    set output to ""
+    set cals to every calendar
+    repeat with c in cals
+        set calName to name of c
+        set acctName to ""
+        try
+            set acctName to name of account of c
+        end try
+        set output to output & calName & "|||" & acctName & "===" 
+    end repeat
+    return output
+end tell'''
+    try:
+        raw = await bridge.run(script, timeout=15)
+        results = []
+        for record in raw.split("==="):
+            record = record.strip()
+            if not record:
+                continue
+            parts = record.split("|||")
+            results.append({
+                "name": parts[0].strip(),
+                "account": parts[1].strip() if len(parts) > 1 else "",
+            })
+        return json.dumps(results, indent=2)
+    except Exception as e:
+        return f"Error listing calendars: {e}"
+
+
+# =====================================================================
+# TOOL 10b: configure_calendars
+# =====================================================================
+
+@mcp.tool()
+async def configure_calendars(include: str) -> str:
+    """Configure which Outlook calendars to include in list_events and search_events.
+
+    Saves the selection permanently. Use list_calendars first to see
+    available calendar names.
+
+    Args:
+        include: Comma-separated list of calendar names to include.
+            Use "ALL" to include every calendar (resets the filter).
+            Example: "Kalender" or "Kalender,Work Calendar"
+
+    Returns:
+        Confirmation message with the saved configuration.
+    """
+    if include.strip().upper() == "ALL":
+        config = {"included": None}
+        msg = "All calendars will be included."
+    else:
+        names = [n.strip() for n in include.split(",") if n.strip()]
+        if not names:
+            return "Error: no calendar names provided."
+        config = {"included": names}
+        msg = f"Only these calendars will be included: {', '.join(names)}"
+
+    try:
+        with open(_CALENDAR_CONFIG_PATH, "w") as f:
+            json.dump(config, f, indent=2)
+        return f"Calendar configuration saved. {msg}"
+    except Exception as e:
+        return f"Error saving configuration: {e}"
+
+
+# =====================================================================
 # TOOL 10: list_events
 # =====================================================================
 
@@ -887,59 +1188,169 @@ async def list_events(
     start = datetime.fromisoformat(start_date) if start_date else datetime.now()
     end = datetime.fromisoformat(end_date) if end_date else start + timedelta(days=7)
 
-    # Fetch more than needed, filter by date in Python since AppleScript
-    # whose-clause date filtering can be unreliable in Outlook for Mac.
-    fetch_limit = count * 3  # overfetch to account for out-of-range events
+    s_yr, s_mo, s_dy = start.year, start.month, start.day
+    s_hr, s_mn = start.hour, start.minute
+    e_yr, e_mo, e_dy = end.year, end.month, end.day
+    e_hr, e_mn = end.hour, end.minute
 
-    script = f'''tell application "Microsoft Outlook"
-    set evts to calendar events
-    set evtCount to count of evts
-    set maxFetch to {fetch_limit}
-    if evtCount < maxFetch then set maxFetch to evtCount
+    _cal_included = _load_calendar_config()
+    _cal_filter_as = _as_cal_filter(_cal_included)
+
+    # 1) Fetch materialized events in the date range
+    script_materialized = f'''{_APPLESCRIPT_DATE_HELPERS}
+
+set startDate to makeDate({s_yr}, {s_mo}, {s_dy}, {s_hr}, {s_mn})
+set endDate to makeDate({e_yr}, {e_mo}, {e_dy}, {e_hr}, {e_mn})
+set calFilter to {_cal_filter_as}
+
+tell application "Microsoft Outlook"
+    set evts to (calendar events whose start time >= startDate and start time <= endDate)
     set output to ""
-    repeat with i from 1 to maxFetch
-        set e to item i of evts
-        set eid to id of e
-        set esubject to subject of e
-        set estart to start time of e as string
-        set eend to end time of e as string
-        set elocation to ""
-        try
-            set elocation to location of e
-        end try
-        set eorganizer to ""
-        try
-            set eorganizer to organizer of e
-        end try
-        set eallday to all day flag of e
-        set output to output & (eid as text) & "{DELIM}" & esubject & "{DELIM}" & estart & "{DELIM}" & eend & "{DELIM}" & elocation & "{DELIM}" & eorganizer & "{DELIM}" & (eallday as text) & "{RECORD_DELIM}"
+    repeat with e in evts
+        if (calFilter is {{}}) or (calFilter contains (name of calendar of e)) then
+            set eid to id of e
+            set esubject to subject of e
+            set estart to my isoFmt(start time of e)
+            set eend to my isoFmt(end time of e)
+            set elocation to ""
+            try
+                set elocation to location of e
+            end try
+            set eorganizer to ""
+            try
+                set eorganizer to organizer of e
+            end try
+            set eallday to all day flag of e
+            set output to output & (eid as text) & "{DELIM}" & esubject & "{DELIM}" & estart & "{DELIM}" & eend & "{DELIM}" & elocation & "{DELIM}" & eorganizer & "{DELIM}" & (eallday as text) & "{RECORD_DELIM}"
+        end if
+    end repeat
+    return output
+end tell'''
+
+    # 2) Fetch recurring master events whose series may overlap the range
+    script_recurring = f'''{_APPLESCRIPT_DATE_HELPERS}
+
+set endDate to makeDate({e_yr}, {e_mo}, {e_dy}, {e_hr}, {e_mn})
+set calFilter to {_cal_filter_as}
+
+tell application "Microsoft Outlook"
+    set recEvts to (calendar events whose is recurring is true and start time <= endDate)
+    set output to ""
+    repeat with e in recEvts
+        if (calFilter is {{}}) or (calFilter contains (name of calendar of e)) then
+            set eid to id of e
+            set esubject to subject of e
+            set estart to my isoFmt(start time of e)
+            set eend to my isoFmt(end time of e)
+            set elocation to ""
+            try
+                set elocation to location of e
+            end try
+            set eorganizer to ""
+            try
+                set eorganizer to organizer of e
+            end try
+            set eallday to all day flag of e
+            -- recurrence fields
+            set recInfo to ""
+            try
+                set rec to recurrence of e
+                set rt to recurrence type of rec as string
+                set ri to occurrence interval of rec as string
+                set dayStr to ""
+                try
+                    set dow to days of week of rec
+                    if monday of dow then set dayStr to dayStr & "MO,"
+                    if tuesday of dow then set dayStr to dayStr & "TU,"
+                    if wednesday of dow then set dayStr to dayStr & "WE,"
+                    if thursday of dow then set dayStr to dayStr & "TH,"
+                    if friday of dow then set dayStr to dayStr & "FR,"
+                    if saturday of dow then set dayStr to dayStr & "SA,"
+                    if sunday of dow then set dayStr to dayStr & "SU,"
+                end try
+                set recEndDate to ""
+                set recEndCount to ""
+                try
+                    set ed to end date of rec
+                    set recEndType to end type of ed as string
+                    try
+                        if recEndType is "end date type" then
+                            set recEndDate to my isoFmt(data of ed)
+                        else if recEndType is "end numbered type" then
+                            set recEndCount to data of ed as string
+                        end if
+                    end try
+                end try
+                set recInfo to rt & ";" & ri & ";" & dayStr & ";" & recEndDate & ";" & recEndCount
+            end try
+            set output to output & (eid as text) & "{DELIM}" & esubject & "{DELIM}" & estart & "{DELIM}" & eend & "{DELIM}" & elocation & "{DELIM}" & eorganizer & "{DELIM}" & (eallday as text) & "{DELIM}" & recInfo & "{RECORD_DELIM}"
+        end if
     end repeat
     return output
 end tell'''
 
     try:
-        raw = await bridge.run(script)
-        if not raw:
-            return json.dumps([])
+        raw = await bridge.run(script_materialized, timeout=60)
 
         results = []
-        for record in raw.split(RECORD_DELIM):
-            record = record.strip()
-            if not record:
-                continue
-            parts = record.split(DELIM)
-            if len(parts) < 7:
-                continue
-            results.append({
-                "entry_id": parts[0].strip(),
-                "subject": parts[1].strip() or "(no subject)",
-                "start": parts[2].strip(),
-                "end": parts[3].strip(),
-                "location": _clean(parts[4]),
-                "organizer": _clean(parts[5]),
-                "all_day": parts[6].strip().lower() == "true",
-            })
-        return json.dumps(results, indent=2, default=str)
+        if raw:
+            for record in raw.split(RECORD_DELIM):
+                record = record.strip()
+                if not record:
+                    continue
+                parts = record.split(DELIM)
+                if len(parts) < 7:
+                    continue
+                results.append({
+                    "entry_id": parts[0].strip(),
+                    "subject": parts[1].strip() or "(no subject)",
+                    "start": parts[2].strip(),
+                    "end": parts[3].strip(),
+                    "location": _clean(parts[4]),
+                    "organizer": _clean(parts[5]),
+                    "all_day": parts[6].strip().lower() == "true",
+                })
+
+        # Fetch and project recurring masters
+        try:
+            raw_rec = await bridge.run(script_recurring, timeout=60)
+            recurring_masters = []
+            if raw_rec:
+                for record in raw_rec.split(RECORD_DELIM):
+                    record = record.strip()
+                    if not record:
+                        continue
+                    parts = record.split(DELIM)
+                    if len(parts) < 8:
+                        continue
+                    rec_info = parts[7].strip()
+                    if not rec_info:
+                        continue
+                    rec_parts = rec_info.split(";")
+                    if len(rec_parts) < 4:
+                        continue
+                    recurring_masters.append({
+                        "entry_id": parts[0].strip(),
+                        "subject": parts[1].strip() or "(no subject)",
+                        "start": parts[2].strip(),
+                        "end": parts[3].strip(),
+                        "location": _clean(parts[4]),
+                        "organizer": _clean(parts[5]),
+                        "all_day": parts[6].strip().lower() == "true",
+                        "rec_type": rec_parts[0],
+                        "rec_interval": rec_parts[1],
+                        "rec_days": rec_parts[2],
+                        "rec_end_date": rec_parts[3],
+                        "rec_max_occurrences": rec_parts[4] if len(rec_parts) > 4 else "0",
+                    })
+
+            projected = _merge_projected_events(results, recurring_masters, start, end)
+            results.extend(projected)
+        except Exception:
+            pass  # Projection failed — return materialized only
+
+        results.sort(key=lambda e: e["start"])
+        return json.dumps(results[:count], indent=2, default=str)
     except Exception as e:
         return f"Error listing events: {e}"
 
@@ -1272,55 +1683,171 @@ async def search_events(
     """
     safe_query = escape(query)
 
-    script = f'''tell application "Microsoft Outlook"
-    set evts to calendar events whose subject contains "{safe_query}"
-    set evtCount to count of evts
-    set maxCount to {count}
-    if evtCount < maxCount then set maxCount to evtCount
+    start = datetime.fromisoformat(start_date) if start_date else datetime.now() - timedelta(days=30)
+    end = datetime.fromisoformat(end_date) if end_date else datetime.now() + timedelta(days=30)
+
+    s_yr, s_mo, s_dy = start.year, start.month, start.day
+    s_hr, s_mn = start.hour, start.minute
+    e_yr, e_mo, e_dy = end.year, end.month, end.day
+    e_hr, e_mn = end.hour, end.minute
+
+    _cal_included = _load_calendar_config()
+    _cal_filter_as = _as_cal_filter(_cal_included)
+
+    # 1) Fetch materialized events matching query in date range
+    script_materialized = f'''{_APPLESCRIPT_DATE_HELPERS}
+
+set startDate to makeDate({s_yr}, {s_mo}, {s_dy}, {s_hr}, {s_mn})
+set endDate to makeDate({e_yr}, {e_mo}, {e_dy}, {e_hr}, {e_mn})
+set calFilter to {_cal_filter_as}
+
+tell application "Microsoft Outlook"
+    set evts to (calendar events whose subject contains "{safe_query}" and start time >= startDate and start time <= endDate)
     set output to ""
-    repeat with i from 1 to maxCount
-        set e to item i of evts
-        set eid to id of e
-        set esubject to subject of e
-        set estart to start time of e as string
-        set eend to end time of e as string
-        set elocation to ""
-        try
-            set elocation to location of e
-        end try
-        set eorganizer to ""
-        try
-            set eorganizer to organizer of e
-        end try
-        set eallday to all day flag of e
-        set output to output & (eid as text) & "{DELIM}" & esubject & "{DELIM}" & estart & "{DELIM}" & eend & "{DELIM}" & elocation & "{DELIM}" & eorganizer & "{DELIM}" & (eallday as text) & "{RECORD_DELIM}"
+    repeat with e in evts
+        if (calFilter is {{}}) or (calFilter contains (name of calendar of e)) then
+            set eid to id of e
+            set esubject to subject of e
+            set estart to my isoFmt(start time of e)
+            set eend to my isoFmt(end time of e)
+            set elocation to ""
+            try
+                set elocation to location of e
+            end try
+            set eorganizer to ""
+            try
+                set eorganizer to organizer of e
+            end try
+            set eallday to all day flag of e
+            set output to output & (eid as text) & "{DELIM}" & esubject & "{DELIM}" & estart & "{DELIM}" & eend & "{DELIM}" & elocation & "{DELIM}" & eorganizer & "{DELIM}" & (eallday as text) & "{RECORD_DELIM}"
+        end if
+    end repeat
+    return output
+end tell'''
+
+    # 2) Fetch recurring masters matching query
+    script_recurring = f'''{_APPLESCRIPT_DATE_HELPERS}
+
+set endDate to makeDate({e_yr}, {e_mo}, {e_dy}, {e_hr}, {e_mn})
+set calFilter to {_cal_filter_as}
+
+tell application "Microsoft Outlook"
+    set recEvts to (calendar events whose subject contains "{safe_query}" and is recurring is true and start time <= endDate)
+    set output to ""
+    repeat with e in recEvts
+        if (calFilter is {{}}) or (calFilter contains (name of calendar of e)) then
+            set eid to id of e
+            set esubject to subject of e
+            set estart to my isoFmt(start time of e)
+            set eend to my isoFmt(end time of e)
+            set elocation to ""
+            try
+                set elocation to location of e
+            end try
+            set eorganizer to ""
+            try
+                set eorganizer to organizer of e
+            end try
+            set eallday to all day flag of e
+            set recInfo to ""
+            try
+                set rec to recurrence of e
+                set rt to recurrence type of rec as string
+                set ri to occurrence interval of rec as string
+                set dayStr to ""
+                try
+                    set dow to days of week of rec
+                    if monday of dow then set dayStr to dayStr & "MO,"
+                    if tuesday of dow then set dayStr to dayStr & "TU,"
+                    if wednesday of dow then set dayStr to dayStr & "WE,"
+                    if thursday of dow then set dayStr to dayStr & "TH,"
+                    if friday of dow then set dayStr to dayStr & "FR,"
+                    if saturday of dow then set dayStr to dayStr & "SA,"
+                    if sunday of dow then set dayStr to dayStr & "SU,"
+                end try
+                set recEndDate to ""
+                set recEndCount to ""
+                try
+                    set ed to end date of rec
+                    set recEndType to end type of ed as string
+                    try
+                        if recEndType is "end date type" then
+                            set recEndDate to my isoFmt(data of ed)
+                        else if recEndType is "end numbered type" then
+                            set recEndCount to data of ed as string
+                        end if
+                    end try
+                end try
+                set recInfo to rt & ";" & ri & ";" & dayStr & ";" & recEndDate & ";" & recEndCount
+            end try
+            set output to output & (eid as text) & "{DELIM}" & esubject & "{DELIM}" & estart & "{DELIM}" & eend & "{DELIM}" & elocation & "{DELIM}" & eorganizer & "{DELIM}" & (eallday as text) & "{DELIM}" & recInfo & "{RECORD_DELIM}"
+        end if
     end repeat
     return output
 end tell'''
 
     try:
-        raw = await bridge.run(script)
-        if not raw:
-            return json.dumps([])
+        raw = await bridge.run(script_materialized, timeout=60)
 
         results = []
-        for record in raw.split(RECORD_DELIM):
-            record = record.strip()
-            if not record:
-                continue
-            parts = record.split(DELIM)
-            if len(parts) < 7:
-                continue
-            results.append({
-                "entry_id": parts[0].strip(),
-                "subject": parts[1].strip() or "(no subject)",
-                "start": parts[2].strip(),
-                "end": parts[3].strip(),
-                "location": _clean(parts[4]),
-                "organizer": _clean(parts[5]),
-                "all_day": parts[6].strip().lower() == "true",
-            })
-        return json.dumps(results, indent=2, default=str)
+        if raw:
+            for record in raw.split(RECORD_DELIM):
+                record = record.strip()
+                if not record:
+                    continue
+                parts = record.split(DELIM)
+                if len(parts) < 7:
+                    continue
+                results.append({
+                    "entry_id": parts[0].strip(),
+                    "subject": parts[1].strip() or "(no subject)",
+                    "start": parts[2].strip(),
+                    "end": parts[3].strip(),
+                    "location": _clean(parts[4]),
+                    "organizer": _clean(parts[5]),
+                    "all_day": parts[6].strip().lower() == "true",
+                })
+
+        # Fetch and project recurring masters
+        try:
+            raw_rec = await bridge.run(script_recurring, timeout=60)
+            recurring_masters = []
+            if raw_rec:
+                for record in raw_rec.split(RECORD_DELIM):
+                    record = record.strip()
+                    if not record:
+                        continue
+                    parts = record.split(DELIM)
+                    if len(parts) < 8:
+                        continue
+                    rec_info = parts[7].strip()
+                    if not rec_info:
+                        continue
+                    rec_parts = rec_info.split(";")
+                    if len(rec_parts) < 4:
+                        continue
+                    recurring_masters.append({
+                        "entry_id": parts[0].strip(),
+                        "subject": parts[1].strip() or "(no subject)",
+                        "start": parts[2].strip(),
+                        "end": parts[3].strip(),
+                        "location": _clean(parts[4]),
+                        "organizer": _clean(parts[5]),
+                        "all_day": parts[6].strip().lower() == "true",
+                        "rec_type": rec_parts[0],
+                        "rec_interval": rec_parts[1],
+                        "rec_days": rec_parts[2],
+                        "rec_end_date": rec_parts[3],
+                        "rec_max_occurrences": rec_parts[4] if len(rec_parts) > 4 else "0",
+                    })
+
+            projected = _merge_projected_events(results, recurring_masters, start, end)
+            results.extend(projected)
+        except Exception:
+            pass
+
+        results.sort(key=lambda e: e["start"])
+        return json.dumps(results[:count], indent=2, default=str)
     except Exception as e:
         return f"Error searching events: {e}"
 
