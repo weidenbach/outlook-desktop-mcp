@@ -274,6 +274,58 @@ end tell'''
 
 
 # =====================================================================
+# TOOL 1b: create_draft
+# =====================================================================
+
+@mcp.tool()
+async def create_draft(
+    to: str,
+    subject: str,
+    body: str,
+    cc: str = "",
+    bcc: str = "",
+) -> str:
+    """Save an email as a draft in the Drafts folder without sending it.
+
+    Creates an outgoing message and moves it to the Drafts folder so the
+    user can review and send it manually later.
+
+    Args:
+        to: One or more recipient email addresses, separated by semicolons.
+        subject: The email subject line.
+        body: The plain-text body of the email.
+        cc: Optional. CC recipients, separated by semicolons.
+        bcc: Optional. BCC recipients, separated by semicolons.
+
+    Returns:
+        A confirmation message, or an error.
+    """
+    def _recipient_lines(addresses: str, kind: str) -> str:
+        lines = ""
+        for addr in addresses.split(";"):
+            addr = addr.strip()
+            if addr:
+                lines += f'make new {kind} at newMsg with properties {{email address:{{address:"{escape(addr)}"}}}}
+    '
+        return lines
+
+    to_lines = _recipient_lines(to, "to recipient")
+    cc_lines = _recipient_lines(cc, "cc recipient") if cc else ""
+    bcc_lines = _recipient_lines(bcc, "bcc recipient") if bcc else ""
+
+    script = f'''tell application "Microsoft Outlook"
+    set newMsg to make new outgoing message with properties {{subject:"{escape(subject)}", content:"{escape(body)}"}}
+    {to_lines}{cc_lines}{bcc_lines}move newMsg to drafts
+end tell'''
+
+    try:
+        await bridge.run(script)
+        return f"Draft saved: '{subject}' to {to}"
+    except Exception as e:
+        return f"Error creating draft: {e}"
+
+
+# =====================================================================
 # TOOL 2: list_emails
 # =====================================================================
 
@@ -317,12 +369,11 @@ async def list_emails(
         set mid to id of m
         set msubject to subject of m
         set msender to ""
-        try
-            set msender to address of sender of m
-        end try
         set msenderName to ""
         try
-            set msenderName to name of sender of m
+            set s to sender of m
+            set msender to address of s
+            set msenderName to name of s
         end try
         set mtime to time received of m as string
         set misread to is read of m
@@ -408,12 +459,11 @@ async def read_email(
     set mid to id of m
     set msubject to subject of m
     set msender to ""
-    try
-        set msender to address of sender of m
-    end try
     set msenderName to ""
     try
-        set msenderName to name of sender of m
+        set s to sender of m
+        set msender to address of s
+        set msenderName to name of s
     end try
     set mtime to time received of m as string
     set misread to is read of m
@@ -425,14 +475,16 @@ async def read_email(
     try
         set recips to to recipients of m
         repeat with r in recips
-            set mto to mto & address of r & "; "
+            set ea to email address of r
+            set mto to mto & (address of ea) & "; "
         end repeat
     end try
     set mcc to ""
     try
         set recips to cc recipients of m
         repeat with r in recips
-            set mcc to mcc & address of r & "; "
+            set ea to email address of r
+            set mcc to mcc & (address of ea) & "; "
         end repeat
     end try
     set mbody to ""
@@ -452,12 +504,11 @@ end tell'''
     set mid to id of m
     set msubject to subject of m
     set msender to ""
-    try
-        set msender to address of sender of m
-    end try
     set msenderName to ""
     try
-        set msenderName to name of sender of m
+        set s to sender of m
+        set msender to address of s
+        set msenderName to name of s
     end try
     set mtime to time received of m as string
     set misread to is read of m
@@ -469,14 +520,16 @@ end tell'''
     try
         set recips to to recipients of m
         repeat with r in recips
-            set mto to mto & address of r & "; "
+            set ea to email address of r
+            set mto to mto & (address of ea) & "; "
         end repeat
     end try
     set mcc to ""
     try
         set recips to cc recipients of m
         repeat with r in recips
-            set mcc to mcc & address of r & "; "
+            set ea to email address of r
+            set mcc to mcc & (address of ea) & "; "
         end repeat
     end try
     set mbody to ""
@@ -753,12 +806,11 @@ async def search_emails(
         set mid to id of m
         set msubject to subject of m
         set msender to ""
-        try
-            set msender to address of sender of m
-        end try
         set msenderName to ""
         try
-            set msenderName to name of sender of m
+            set s to sender of m
+            set msender to address of s
+            set msenderName to name of s
         end try
         set mtime to time received of m as string
         set misread to is read of m
